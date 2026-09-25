@@ -1,0 +1,235 @@
+# Crear este archivo en: .github/workflows/alertas.yml
+# No pegar el webhook aqui. Se obtiene del secreto DISCORD_WEBHOOK_URL.
+# Una revision por ejecucion. El horario puede retrasarse en GitHub.
+# Se guardan solo IDs publicos de eventos en polymarket_cs2_estado.json.
+# No borrar ese archivo: evita volver a anunciar partidos vistos.
+# Un fallo despues del envio y antes de guardar en GitHub puede repetir un aviso.
+# En repositorios publicos, GitHub puede desactivar la programacion tras
+# 60 dias sin actividad. Revisar Actions periodicamente.
+name: Alertas CS2 Polymarket
+
+on:
+  schedule:
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: polymarket-cs2
+  cancel-in-progress: false
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Descargar codigo y estado mas reciente
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Consultar Polymarket y enviar avisos
+        timeout-minutes: 11
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PRUEBA_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          python3 -u - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode, urlsplit, quote
+          from urllib.request import Request, urlopen
+          
+          API = 'https://gamma-api.polymarket.com'
+          STATE = Path('polymarket_cs2_estado.json')
+          
+          class Error(Exception):
+              pass
+          
+          
+          def request(url, payload=None):
+              data = None if payload is None else json.dumps(payload).encode('utf-8')
+              req = Request(url, data=data, headers={
+                  'User-Agent': 'CS2-Discord-Notifier/1.0',
+                  'Accept': 'application/json', 'Content-Type': 'application/json'})
+              try:
+                  with urlopen(req, timeout=30) as response:
+                      body = response.read()
+                      return json.loads(body) if body else None
+              except HTTPError as exc:
+                  # No imprimir la excepcion completa: puede contener el webhook.
+                  service = 'Polymarket' if url.startswith(API + '/') else 'Discord'
+                  raise Error(f'{service}: error HTTP {exc.code}. No se ha completado la consulta o envio.') from None
+              except (URLError, TimeoutError, OSError):
+                  raise Error('No se pudo conectar. Comprueba Internet.') from None
+              except (ValueError, UnicodeError):
+                  raise Error('El servidor devolvio una respuesta inesperada.') from None
+          
+          
+          def is_cs2_match(event):
+              title = str(event.get('title') or '').lower()
+              slug = str(event.get('slug') or '').lower()
+              tags = event.get('tags') or []
+              tag_names = {str(t.get(k) or '').lower() for t in tags if isinstance(t, dict)
+                           for k in ('label', 'slug')}
+              cs = (slug.startswith('cs2-') or 'counter-strike' in title
+                    or 'counter strike' in title or bool(re.search(r'\bcs2\b', title))
+                    or bool(tag_names & {'cs2', 'counter-strike', 'counter-strike-2'}))
+              return cs and bool(re.search(r'\bvs\.?\s', title)) and not event.get('closed', False)
+          
+          
+          def fetch_matches():
+              found = {}
+              cursor = None
+              cursors = set()
+              deadline = time.monotonic() + 480
+              for page_number in range(500):
+                  if time.monotonic() > deadline:
+                      raise Error('La consulta supero 8 minutos; no se guardara una lectura parcial.')
+                  if page_number % 20 == 0:
+                      print(f'Consultando pagina {page_number + 1}...')
+                  params = {'closed': 'false', 'limit': 100}
+                  if cursor:
+                      params['after_cursor'] = cursor
+                  page = read_page(API + '/events/keyset?' + urlencode(params))
+                  if not isinstance(page, dict) or not isinstance(page.get('events'), list):
+                      raise Error('Polymarket cambio el formato de eventos; hay que revisar el programa.')
+                  for event in page['events']:
+                      if not isinstance(event, dict) or not event.get('id'):
+                          raise Error('Se recibio un evento incompleto; se reintentara la lectura.')
+                      if is_cs2_match(event):
+                          found[str(event['id'])] = event
+                  cursor = page.get('next_cursor')
+                  if not cursor:
+                      return found
+                  if not isinstance(cursor, str) or cursor in cursors:
+                      raise Error('La paginacion de Polymarket no avanzo; no se guardara una lectura parcial.')
+                  cursors.add(cursor)
+              raise Error('Demasiadas paginas de eventos; no se guardara una lectura parcial.')
+          
+          
+          def load_state():
+              if not STATE.exists():
+                  return None
+              try:
+                  data = json.loads(STATE.read_text(encoding='utf-8'))
+                  if data.get('version') != 1 or not isinstance(data['seen'], list):
+                      raise ValueError()
+                  if not all(isinstance(x, str) for x in data['seen']):
+                      raise ValueError()
+                  return set(data['seen'])
+              except (ValueError, KeyError, AttributeError):
+                  raise Error('El archivo de estado no es valido. Conserva una copia y pide ayuda antes de borrarlo.') from None
+          
+          
+          def save_state(seen):
+              tmp = STATE.with_suffix('.tmp')
+              tmp.write_text(json.dumps({'version': 1, 'seen': sorted(seen)}), encoding='utf-8')
+              tmp.replace(STATE)
+          
+          
+          def webhook_url():
+              value = os.environ.get('DISCORD_WEBHOOK_URL', '').strip()
+              if not value:
+                  raise Error('Falta el secreto DISCORD_WEBHOOK_URL en Settings > Secrets and variables > Actions.')
+              parsed = urlsplit(value)
+              if (parsed.scheme != 'https' or parsed.netloc != 'discord.com'
+                      or not re.fullmatch(r'/api(?:/v\d+)?/webhooks/\d+/[A-Za-z0-9_-]+', parsed.path)
+                      or parsed.query or parsed.fragment):
+                  raise Error('La URL no tiene el formato de un webhook de Discord. Copiala de nuevo desde Discord.')
+              return value + '?wait=true'
+          
+          
+          def send(webhook, text):
+              request(webhook, {'content': text[:1900], 'allowed_mentions': {'parse': []}})
+          
+          
+          def alert(event):
+              title = str(event.get('title') or 'Partido de CS2')[:500]
+              slug = quote(str(event.get('slug') or ''), safe='')
+              link = 'https://polymarket.com/event/' + slug if slug else 'https://polymarket.com/esports/cs2'
+              return f'NUEVO PARTIDO CS2 DETECTADO EN POLYMARKET\n{title}\n{link}'
+          
+          
+          def process(matches, seen, webhook):
+              if seen is None:
+                  seen = set(matches)
+                  save_state(seen)
+                  print(f'Lectura inicial: {len(seen)} partidos existentes guardados sin anunciarlos.')
+                  return seen
+              for event_id, event in matches.items():
+                  if event_id not in seen:
+                      send(webhook, alert(event))
+                      seen.add(event_id)
+                      save_state(seen)
+                      print('Aviso enviado:', event.get('title', event_id))
+                      time.sleep(1)
+              return seen
+          
+          
+          def read_page(url):
+              for attempt in range(3):
+                  try:
+                      return request(url)
+                  except Error:
+                      if attempt == 2:
+                          raise
+                      print('Consulta interrumpida. Reintentando esta pagina...')
+                      time.sleep(3 * (attempt + 1))
+          
+          
+          def main():
+              webhook = webhook_url()
+              seen = load_state()
+              matches = fetch_matches()
+              first = seen is None
+              process(matches, seen, webhook)
+              if first or os.environ.get('PRUEBA_MANUAL') == 'true':
+                  send(webhook, 'Polymarket CS2: revision desde GitHub completada. '
+                       'Los partidos ya registrados no se anuncian. '
+                       'Las siguientes revisiones se ejecutaran en la nube.')
+              print(f'Revision completada: {len(matches)} partidos CS2 en la fuente.')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  main()
+              except (Error, OSError) as exc:
+                  print(str(exc) if isinstance(exc, Error) else 'Error al leer o guardar el estado.')
+                  raise SystemExit(1)
+          PY
+
+      - name: Guardar partidos vistos incluso si algun envio falla
+        if: ${{ always() }}
+        env:
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          if [ ! -f polymarket_cs2_estado.json ]; then
+            echo "No hay una lectura completa que guardar."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- polymarket_cs2_estado.json
+          if git diff --cached --quiet; then
+            echo "Sin cambios en los partidos vistos."
+            exit 0
+          fi
+          git commit -m "Guardar partidos CS2 vistos"
+          for attempt in 1 2 3; do
+            git pull --rebase origin "$TARGET_BRANCH"
+            if git push origin "HEAD:$TARGET_BRANCH"; then
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "No se pudo guardar el estado. Revisar este error para evitar duplicados."
+          exit 1
