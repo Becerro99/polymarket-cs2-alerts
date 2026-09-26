@@ -148,7 +148,7 @@ jobs:
           
           
           def send(webhook, text):
-              request(webhook, {'content': text[:1900], 'allowed_mentions': {'parse': []}})
+              request(webhook, {'content': ('@everyone\n' + text)[:1900], 'allowed_mentions': {'parse': ['everyone']}})
           
           
           def alert(event):
